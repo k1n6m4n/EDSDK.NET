@@ -112,6 +112,7 @@ namespace EDSDK.NET
         public delegate void ProgressHandler(int Progress);
         public delegate void StreamUpdate(Stream img);
         public delegate void BitmapUpdate(Bitmap bmp);
+        public delegate void ImageDownloadedHandler(string fileName);
 
         /// <summary>
         /// Fires if a camera is added
@@ -133,6 +134,8 @@ namespace EDSDK.NET
         /// If an image is downloaded, this event fires with the downloaded image.
         /// </summary>
         public event BitmapUpdate ImageDownloaded;
+
+        public event ImageDownloadedHandler ImageDownloadedWithFileName;
 
         #endregion
 
@@ -570,6 +573,31 @@ namespace EDSDK.NET
         #region Camera commands
 
         #region Download data
+
+        public void DownloadImageAndNotify(IntPtr ObjectPointer, string directory)
+        {
+            EdsDirectoryItemInfo dirInfo;
+            IntPtr streamRef;
+            //get information about object
+            Error = EdsGetDirectoryItemInfo(ObjectPointer, out dirInfo);
+            string CurrentPhoto = Path.Combine(directory, dirInfo.szFileName);
+
+            SendSDKCommand(delegate
+            {
+                //create filestream to data
+                Error = EdsCreateFileStream(CurrentPhoto, EdsFileCreateDisposition.CreateAlways, EdsAccess.ReadWrite, out streamRef);
+                //download file
+                lock (STAThread.ExecLock) { DownloadData(ObjectPointer, streamRef); }
+                //release stream
+                Error = EdsRelease(streamRef);
+
+                // Fire the event with the file name
+                if (ImageDownloadedWithFileName != null)
+                {
+                    ImageDownloadedWithFileName(dirInfo.szFileName);
+                }
+            }, true);
+        }
 
         /// <summary>
         /// Downloads an image to given directory

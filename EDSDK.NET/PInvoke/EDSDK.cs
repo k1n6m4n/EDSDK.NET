@@ -9,7 +9,7 @@ namespace EDSDKLib
         /// <summary>
         /// Path to the EDSDK DLL
         /// </summary>
-        const string DLLPath = ".\\Resources\\EDSDK.dll";
+        const string DLLPath = ".\\EDSDK.dll";
 
         #region Callback Functions
 
