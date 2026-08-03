@@ -540,31 +540,43 @@ namespace EDSDK.NET
         /// <returns>An EDSDK errorcode</returns>
         private uint Camera_SDKStateEvent(uint inEvent, uint inParameter, IntPtr inContext)
         {
-            //Handle state event here
-            switch (inEvent)
+            //Handle state event here.
+            //NOTE: this runs on a native SDK callback thread. Anything that escapes
+            //this method unwinds through unmanaged code and kills the process with no
+            //first-chance handler, so the whole switch is guarded.
+            try
             {
-                case StateEvent_All:
-                    break;
-                case StateEvent_AfResult:
-                    break;
-                case StateEvent_BulbExposureTime:
-                    break;
-                case StateEvent_CaptureError:
-                    break;
-                case StateEvent_InternalError:
-                    break;
-                case StateEvent_JobStatusChanged:
-                    break;
-                case StateEvent_Shutdown:
-                    CameraSessionOpen = false;
-                    if (LVThread.IsAlive) LVThread.Abort();
-                    if (CameraHasShutdown != null) CameraHasShutdown(this, new EventArgs());
-                    break;
-                case StateEvent_ShutDownTimerUpdate:
-                    break;
-                case StateEvent_WillSoonShutDown:
-                    break;
+                switch (inEvent)
+                {
+                    case StateEvent_All:
+                        break;
+                    case StateEvent_AfResult:
+                        break;
+                    case StateEvent_BulbExposureTime:
+                        break;
+                    case StateEvent_CaptureError:
+                        break;
+                    case StateEvent_InternalError:
+                        break;
+                    case StateEvent_JobStatusChanged:
+                        break;
+                    case StateEvent_Shutdown:
+                        CameraSessionOpen = false;
+                        //Thread.Abort is unsupported on .NET 5+ (throws
+                        //PlatformNotSupportedException). Flip the live view loop's own
+                        //exit condition instead and wait for it, bounded.
+                        IsLiveViewOn = false;
+                        try { LVThread?.Join(1000); }
+                        catch { }
+                        if (CameraHasShutdown != null) CameraHasShutdown(this, new EventArgs());
+                        break;
+                    case StateEvent_ShutDownTimerUpdate:
+                        break;
+                    case StateEvent_WillSoonShutDown:
+                        break;
+                }
             }
+            catch { }
             return EDS_ERR_OK;
         }
 
