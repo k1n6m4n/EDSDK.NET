@@ -25,7 +25,9 @@ namespace EDSDK.NET
         public uint Error
         {
             get { return EDS_ERR_OK; }
-            set { if (value != EDS_ERR_OK) throw new Exception("SDK Error: " + value); }
+            //Same SDKException as SDKHandler: hex code + constant name. This one used
+            //to print the code in decimal, which the caller's "0x" parser can't read.
+            set { if (value != EDS_ERR_OK) throw new SDKException(value); }
         }
 
         /// <summary>

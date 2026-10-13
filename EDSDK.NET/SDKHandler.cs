@@ -69,7 +69,7 @@ namespace EDSDK.NET
             {
                 if (value != EDS_ERR_OK)
                 {
-                    throw new Exception("SDK Error: 0x" + value.ToString("X"));
+                    throw new SDKException(value);
                 }
             }
         }
@@ -136,6 +136,25 @@ namespace EDSDK.NET
         public event BitmapUpdate ImageDownloaded;
 
         public event ImageDownloadedHandler ImageDownloadedWithFileName;
+
+        public delegate void BackgroundErrorHandler(string operation, Exception ex);
+        /// <summary>
+        /// Fires when something fails on a thread the caller does not own: a
+        /// download, a long-running camera command, the live view loop, or an SDK
+        /// callback. Before this existed those exceptions either killed the process
+        /// (download / command threads) or vanished without a trace (live view).
+        /// <paramref name="operation"/> names what failed, e.g. "DownloadImageAndNotify".
+        /// Fires on the failing thread.
+        /// </summary>
+        public event BackgroundErrorHandler BackgroundError;
+
+        public delegate void StateEventHandler(uint inEvent, uint inParameter);
+        /// <summary>
+        /// Every camera state event (InternalError, CaptureError, WillSoonShutDown,
+        /// Shutdown, ...), passed through so the caller can log them. Fires on the
+        /// SDK callback thread.
+        /// </summary>
+        public event StateEventHandler StateChanged;
 
         #endregion
 
@@ -214,11 +233,16 @@ namespace EDSDK.NET
         {
             if (CameraSessionOpen)
             {
-                //if live view is still on, stop it and wait till the thread has stopped
+                //if live view is still on, stop it and wait till the thread has stopped.
+                //LVThread only exists once the camera answers the Evf_OutputDevice
+                //property event, so a session closed right after StartLiveView has
+                //IsLiveViewOn = true and no thread yet: the old unguarded Join threw
+                //NullReferenceException here and skipped the rest of the close (event
+                //handlers, EdsCloseSession, EdsRelease).
                 if (IsLiveViewOn)
                 {
                     StopLiveView();
-                    LVThread.Join(1000);
+                    LVThread?.Join(1000);
                 }
 
                 //Remove the event handler
@@ -238,12 +262,19 @@ namespace EDSDK.NET
         /// </summary>
         public void Dispose()
         {
-            //close session
-            CloseSession();
-            //terminate SDK
-            Error = EdsTerminateSDK();
-            //stop command execution thread
-            STAThread.Shutdown();
+            //close session. A failed close must not leave the SDK initialized and the
+            //command thread running, so the rest always runs.
+            try { CloseSession(); }
+            finally
+            {
+                //terminate SDK
+                try { Error = EdsTerminateSDK(); }
+                finally
+                {
+                    //stop command execution thread
+                    STAThread.Shutdown();
+                }
+            }
         }
 
         #endregion
@@ -257,8 +288,11 @@ namespace EDSDK.NET
         /// <returns>An EDSDK errorcode</returns>
         private uint SDKHandler_CameraAddedEvent(IntPtr inContext)
         {
-            //Handle new camera here
-            if (CameraAdded != null) CameraAdded();
+            //Handle new camera here. Runs on a native SDK callback thread, like every
+            //handler below: an exception escaping one unwinds through unmanaged code
+            //and kills the process, so each is guarded and reported instead.
+            try { if (CameraAdded != null) CameraAdded(); }
+            catch (Exception ex) { RaiseBackgroundError("CameraAddedEvent", ex); }
             return EDS_ERR_OK;
         }
 
@@ -272,37 +306,41 @@ namespace EDSDK.NET
         private uint Camera_SDKObjectEvent(uint inEvent, IntPtr inRef, IntPtr inContext)
         {
             //handle object event here
-            switch (inEvent)
+            try
             {
-                case ObjectEvent_All:
-                    break;
-                case ObjectEvent_DirItemCancelTransferDT:
-                    break;
-                case ObjectEvent_DirItemContentChanged:
-                    break;
-                case ObjectEvent_DirItemCreated:
-                    if (DownloadVideo) { DownloadImage(inRef, ImageSaveDirectory); DownloadVideo = false; }
-                    break;
-                case ObjectEvent_DirItemInfoChanged:
-                    break;
-                case ObjectEvent_DirItemRemoved:
-                    break;
-                case ObjectEvent_DirItemRequestTransfer:
-                    DownloadImage(inRef, ImageSaveDirectory);
-                    break;
-                case ObjectEvent_DirItemRequestTransferDT:
-                    break;
-                case ObjectEvent_FolderUpdateItems:
-                    break;
-                case ObjectEvent_VolumeAdded:
-                    break;
-                case ObjectEvent_VolumeInfoChanged:
-                    break;
-                case ObjectEvent_VolumeRemoved:
-                    break;
-                case ObjectEvent_VolumeUpdateItems:
-                    break;
+                switch (inEvent)
+                {
+                    case ObjectEvent_All:
+                        break;
+                    case ObjectEvent_DirItemCancelTransferDT:
+                        break;
+                    case ObjectEvent_DirItemContentChanged:
+                        break;
+                    case ObjectEvent_DirItemCreated:
+                        if (DownloadVideo) { DownloadImage(inRef, ImageSaveDirectory); DownloadVideo = false; }
+                        break;
+                    case ObjectEvent_DirItemInfoChanged:
+                        break;
+                    case ObjectEvent_DirItemRemoved:
+                        break;
+                    case ObjectEvent_DirItemRequestTransfer:
+                        DownloadImage(inRef, ImageSaveDirectory);
+                        break;
+                    case ObjectEvent_DirItemRequestTransferDT:
+                        break;
+                    case ObjectEvent_FolderUpdateItems:
+                        break;
+                    case ObjectEvent_VolumeAdded:
+                        break;
+                    case ObjectEvent_VolumeInfoChanged:
+                        break;
+                    case ObjectEvent_VolumeRemoved:
+                        break;
+                    case ObjectEvent_VolumeUpdateItems:
+                        break;
+                }
             }
+            catch (Exception ex) { RaiseBackgroundError("ObjectEvent", ex); }
 
             return EDS_ERR_OK;
         }
@@ -317,7 +355,8 @@ namespace EDSDK.NET
         private uint Camera_SDKProgressCallbackEvent(uint inPercent, IntPtr inContext, ref bool outCancel)
         {
             //Handle progress here
-            if (ProgressChanged != null) ProgressChanged((int)inPercent);
+            try { if (ProgressChanged != null) ProgressChanged((int)inPercent); }
+            catch (Exception ex) { RaiseBackgroundError("ProgressCallback", ex); }
             return EDS_ERR_OK;
         }
 
@@ -413,7 +452,8 @@ namespace EDSDK.NET
                 case PropID_Evf_Mode:
                     break;
                 case PropID_Evf_OutputDevice:
-                    if (IsLiveViewOn == true) DownloadEvf();
+                    try { if (IsLiveViewOn == true) DownloadEvf(); }
+                    catch (Exception ex) { RaiseBackgroundError("PropertyEvent", ex); }
                     break;
                 case PropID_Evf_WhiteBalance:
                     break;
@@ -546,6 +586,8 @@ namespace EDSDK.NET
             //first-chance handler, so the whole switch is guarded.
             try
             {
+                if (StateChanged != null) StateChanged(inEvent, inParameter);
+
                 switch (inEvent)
                 {
                     case StateEvent_All:
@@ -576,7 +618,7 @@ namespace EDSDK.NET
                         break;
                 }
             }
-            catch { }
+            catch (Exception ex) { RaiseBackgroundError("StateEvent", ex); }
             return EDS_ERR_OK;
         }
 
@@ -586,29 +628,26 @@ namespace EDSDK.NET
 
         #region Download data
 
+        /// <summary>
+        /// Downloads an image to given directory and fires ImageDownloadedWithFileName.
+        /// The download runs on its own thread: a failure there fires BackgroundError
+        /// ("DownloadImageAndNotify") instead of ImageDownloadedWithFileName.
+        /// </summary>
         public void DownloadImageAndNotify(IntPtr ObjectPointer, string directory)
         {
-            EdsDirectoryItemInfo dirInfo;
-            IntPtr streamRef;
-            //get information about object
-            Error = EdsGetDirectoryItemInfo(ObjectPointer, out dirInfo);
+            EdsDirectoryItemInfo dirInfo = GetItemInfoOrAbandon(ObjectPointer);
             string CurrentPhoto = Path.Combine(directory, dirInfo.szFileName);
 
             SendSDKCommand(delegate
             {
-                //create filestream to data
-                Error = EdsCreateFileStream(CurrentPhoto, EdsFileCreateDisposition.CreateAlways, EdsAccess.ReadWrite, out streamRef);
-                //download file
-                lock (STAThread.ExecLock) { DownloadData(ObjectPointer, streamRef); }
-                //release stream
-                Error = EdsRelease(streamRef);
+                DownloadToFile(ObjectPointer, CurrentPhoto);
 
                 // Fire the event with the file name
                 if (ImageDownloadedWithFileName != null)
                 {
                     ImageDownloadedWithFileName(dirInfo.szFileName);
                 }
-            }, true);
+            }, true, "DownloadImageAndNotify");
         }
 
         /// <summary>
@@ -618,21 +657,74 @@ namespace EDSDK.NET
         /// <param name="directory">Path to where the image will be saved to</param>
         public void DownloadImage(IntPtr ObjectPointer, string directory)
         {
-            EdsDirectoryItemInfo dirInfo;
-            IntPtr streamRef;
-            //get information about object
-            Error = EdsGetDirectoryItemInfo(ObjectPointer, out dirInfo);
+            EdsDirectoryItemInfo dirInfo = GetItemInfoOrAbandon(ObjectPointer);
             string CurrentPhoto = Path.Combine(directory, dirInfo.szFileName);
 
-            SendSDKCommand(delegate
+            SendSDKCommand(delegate { DownloadToFile(ObjectPointer, CurrentPhoto); }, true, "DownloadImage");
+        }
+
+        /// <summary>
+        /// Reads an object's directory info. If that fails the object is handed back
+        /// to the camera (cancelled + released) before the error is rethrown, so a
+        /// failed transfer request can't leave the camera waiting on it.
+        /// </summary>
+        private EdsDirectoryItemInfo GetItemInfoOrAbandon(IntPtr ObjectPointer)
+        {
+            EdsDirectoryItemInfo dirInfo;
+            uint err = EdsGetDirectoryItemInfo(ObjectPointer, out dirInfo);
+            if (err != EDS_ERR_OK)
+            {
+                AbandonTransfer(ObjectPointer);
+                Error = err;
+            }
+            return dirInfo;
+        }
+
+        /// <summary>
+        /// Downloads the object into a new file. On any failure the stream is still
+        /// released (an unreleased stream keeps the half-written file open and
+        /// locked) and the partial file is deleted; the error is rethrown.
+        /// </summary>
+        private void DownloadToFile(IntPtr ObjectPointer, string path)
+        {
+            IntPtr streamRef = IntPtr.Zero;
+            bool downloaded = false;
+            try
             {
                 //create filestream to data
-                Error = EdsCreateFileStream(CurrentPhoto, EdsFileCreateDisposition.CreateAlways, EdsAccess.ReadWrite, out streamRef);
+                uint err = EdsCreateFileStream(path, EdsFileCreateDisposition.CreateAlways, EdsAccess.ReadWrite, out streamRef);
+                if (err != EDS_ERR_OK)
+                {
+                    //DownloadData never ran, so nothing completed the transfer
+                    streamRef = IntPtr.Zero;
+                    AbandonTransfer(ObjectPointer);
+                    Error = err;
+                }
                 //download file
                 lock (STAThread.ExecLock) { DownloadData(ObjectPointer, streamRef); }
+                downloaded = true;
+            }
+            finally
+            {
                 //release stream
-                Error = EdsRelease(streamRef);
-            }, true);
+                if (streamRef != IntPtr.Zero) EdsRelease(streamRef);
+                if (!downloaded)
+                {
+                    try { if (File.Exists(path)) File.Delete(path); }
+                    catch { }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Gives up on a transfer the camera requested: cancel it and release the
+        /// object. Best effort, return codes ignored — this only runs on a path that
+        /// is already failing.
+        /// </summary>
+        private static void AbandonTransfer(IntPtr ObjectPointer)
+        {
+            try { EdsDownloadCancel(ObjectPointer); } catch { }
+            try { EdsRelease(ObjectPointer); } catch { }
         }
 
         /// <summary>
@@ -642,8 +734,7 @@ namespace EDSDK.NET
         public void DownloadImage(IntPtr ObjectPointer)
         {
             //get information about image
-            EdsDirectoryItemInfo dirInfo = new EdsDirectoryItemInfo();
-            Error = EdsGetDirectoryItemInfo(ObjectPointer, out dirInfo);
+            EdsDirectoryItemInfo dirInfo = GetItemInfoOrAbandon(ObjectPointer);
 
             //check the extension. Raw data cannot be read by the bitmap class
             string ext = Path.GetExtension(dirInfo.szFileName).ToLower();
@@ -652,33 +743,45 @@ namespace EDSDK.NET
                 SendSDKCommand(delegate
                 {
                     Bitmap bmp = null;
-                    IntPtr streamRef, jpgPointer = IntPtr.Zero;
+                    IntPtr streamRef = IntPtr.Zero, jpgPointer = IntPtr.Zero;
                     ulong length = 0;
 
-                    //create memory stream
-                    Error = EdsCreateMemoryStream(dirInfo.Size, out streamRef);
-
-                    //download data to the stream
-                    lock (STAThread.ExecLock) { DownloadData(ObjectPointer, streamRef); }
-                    Error = EdsGetPointer(streamRef, out jpgPointer);
-                    Error = EdsGetLength(streamRef, out length);
-
-                    unsafe
+                    try
                     {
-                        //create a System.IO.Stream from the pointer
-                        using (UnmanagedMemoryStream ums = new UnmanagedMemoryStream((byte*)jpgPointer.ToPointer(), (long)length, (long)length, FileAccess.Read))
+                        //create memory stream
+                        uint err = EdsCreateMemoryStream(dirInfo.Size, out streamRef);
+                        if (err != EDS_ERR_OK)
                         {
-                            //create bitmap from stream (it's a normal jpeg image)
-                            bmp = new Bitmap(ums);
+                            //DownloadData never ran, so nothing completed the transfer
+                            streamRef = IntPtr.Zero;
+                            AbandonTransfer(ObjectPointer);
+                            Error = err;
+                        }
+
+                        //download data to the stream
+                        lock (STAThread.ExecLock) { DownloadData(ObjectPointer, streamRef); }
+                        Error = EdsGetPointer(streamRef, out jpgPointer);
+                        Error = EdsGetLength(streamRef, out length);
+
+                        unsafe
+                        {
+                            //create a System.IO.Stream from the pointer
+                            using (UnmanagedMemoryStream ums = new UnmanagedMemoryStream((byte*)jpgPointer.ToPointer(), (long)length, (long)length, FileAccess.Read))
+                            {
+                                //create bitmap from stream (it's a normal jpeg image)
+                                bmp = new Bitmap(ums);
+                            }
                         }
                     }
-
-                    //release data
-                    Error = EdsRelease(streamRef);
+                    finally
+                    {
+                        //release data, also when the download or the decode failed
+                        if (streamRef != IntPtr.Zero) EdsRelease(streamRef);
+                    }
 
                     //Fire the event with the image
                     if (ImageDownloaded != null) ImageDownloaded(bmp);
-                }, true);
+                }, true, "DownloadImage(Bitmap)");
             }
             else
             {
@@ -708,23 +811,27 @@ namespace EDSDK.NET
         /// <param name="stream">Pointer to the stream created in advance</param>
         private void DownloadData(IntPtr ObjectPointer, IntPtr stream)
         {
-            //get information about the object
-            EdsDirectoryItemInfo dirInfo;
-            Error = EdsGetDirectoryItemInfo(ObjectPointer, out dirInfo);
-
+            bool downloaded = false;
             try
             {
+                //get information about the object
+                EdsDirectoryItemInfo dirInfo;
+                Error = EdsGetDirectoryItemInfo(ObjectPointer, out dirInfo);
                 //set progress event
                 Error = EdsSetProgressCallback(stream, SDKProgressCallbackEvent, EdsProgressOption.Periodically, ObjectPointer);
                 //download the data
                 Error = EdsDownload(ObjectPointer, dirInfo.Size, stream);
+                downloaded = true;
             }
             finally
             {
-                //set the download as complete
-                Error = EdsDownloadComplete(ObjectPointer);
-                //release object
-                Error = EdsRelease(ObjectPointer);
+                //set the download as complete and release the object. Both always
+                //run: on a failed download the old `Error =` here threw from the
+                //finally, replacing the real error (e.g. 0xA8 stream write) with the
+                //clean-up's, and skipped the EdsRelease.
+                uint done = EdsDownloadComplete(ObjectPointer);
+                uint released = EdsRelease(ObjectPointer);
+                if (downloaded) { Error = done; Error = released; }
             }
         }
 
@@ -990,10 +1097,10 @@ namespace EDSDK.NET
         {
             LVThread = STAThread.Create(delegate
             {
+                IntPtr stream = IntPtr.Zero;
                 try
                 {
                     IntPtr jpgPointer;
-                    IntPtr stream = IntPtr.Zero;
                     IntPtr EvfImageRef = IntPtr.Zero;
                     UnmanagedMemoryStream ums;
 
@@ -1036,11 +1143,20 @@ namespace EDSDK.NET
                     }
 
                     //release and finish
-                    if (stream != IntPtr.Zero) { Error = EdsRelease(stream); }
+                    IntPtr s = stream;
+                    stream = IntPtr.Zero;
+                    if (s != IntPtr.Zero) { Error = EdsRelease(s); }
                     //stop the live view
                     SetSetting(PropID_Evf_OutputDevice, LVoff ? 0 : EvfOutputDevice_TFT);
                 }
-                catch { IsLiveViewOn = false; }
+                catch (Exception ex)
+                {
+                    //Live view died. It used to stop here without a trace; report why
+                    //so a frozen feed can be explained from the caller's log.
+                    IsLiveViewOn = false;
+                    if (stream != IntPtr.Zero) { try { EdsRelease(stream); } catch { } }
+                    RaiseBackgroundError("LiveView", ex);
+                }
             });
             LVThread.Start();
         }
@@ -1169,7 +1285,7 @@ namespace EDSDK.NET
             {
                 //send command to camera
                 lock (STAThread.ExecLock) { Error = EdsSendCommand(MainCamera.Ref, CameraCommand_PressShutterButton, (int)state); };
-            }, true);
+            }, true, "PressShutterButton");
         }
 
         /// <summary>
@@ -1182,7 +1298,7 @@ namespace EDSDK.NET
             {
                 //send command to camera
                 lock (STAThread.ExecLock) { Error = EdsSendCommand(MainCamera.Ref, CameraCommand_TakePicture, 0); };
-            }, true);
+            }, true, "TakePhoto");
         }
 
         /// <summary>
@@ -1203,7 +1319,7 @@ namespace EDSDK.NET
                 Thread.Sleep((int)BulbTime);
                 //close shutter
                 lock (STAThread.ExecLock) { Error = EdsSendCommand(MainCamera.Ref, CameraCommand_BulbEnd, 0); }
-            }, true);
+            }, true, "TakePhoto(Bulb)");
         }
 
         #endregion
@@ -1213,10 +1329,31 @@ namespace EDSDK.NET
         /// <summary>
         /// Sends a command to the camera safely
         /// </summary>
-        private void SendSDKCommand(Action command, bool longTask = false)
+        private void SendSDKCommand(Action command, bool longTask = false, string operation = null)
         {
-            if (longTask) STAThread.Create(command).Start();
+            if (longTask)
+            {
+                //A long task runs on its own thread, so the caller has already returned
+                //and can't catch anything thrown here. Unguarded, one failed SDK call
+                //(e.g. 0xA8 while saving a photo) killed the whole process. Report it
+                //through BackgroundError instead.
+                STAThread.Create(delegate
+                {
+                    try { command(); }
+                    catch (Exception ex) { RaiseBackgroundError(operation ?? "SDKCommand", ex); }
+                }).Start();
+            }
             else STAThread.ExecuteSafely(command);
+        }
+
+        /// <summary>
+        /// Fires BackgroundError. A throwing subscriber must not bring back the very
+        /// crash this exists to prevent, so its own exceptions are dropped.
+        /// </summary>
+        private void RaiseBackgroundError(string operation, Exception ex)
+        {
+            try { BackgroundError?.Invoke(operation, ex); }
+            catch { }
         }
 
         /// <summary>
