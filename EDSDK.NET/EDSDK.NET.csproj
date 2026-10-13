@@ -3,6 +3,16 @@
   <PropertyGroup>
     <TargetFramework>netstandard2.0</TargetFramework>
     <PlatformTarget>AnyCPU</PlatformTarget>
+    <!-- Upstream ships no version properties, so every build reported 1.0.0.0 and
+         a patched DLL was indistinguishable from stock in the field. 1.1.0 marks
+         the first QBooth-patched build (shutdown-crash fix). Bump the minor on
+         every further wrapper change so a client machine can be identified from
+         the file properties alone. -->
+    <Version>1.1.0</Version>
+    <AssemblyVersion>1.1.0.0</AssemblyVersion>
+    <FileVersion>1.1.0.0</FileVersion>
+    <Company>Kingman Husada</Company>
+    <Product>EDSDK.NET (QBooth patched)</Product>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
