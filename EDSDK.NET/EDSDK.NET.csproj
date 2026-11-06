@@ -10,9 +10,11 @@
          the file properties alone. -->
     <!-- 1.2.0: errors on background threads are reported via BackgroundError
          instead of killing the process; SDKException carries code + name. -->
-    <Version>1.2.0</Version>
-    <AssemblyVersion>1.2.0.0</AssemblyVersion>
-    <FileVersion>1.2.0.0</FileVersion>
+    <!-- 1.3.0: live-view loop unchanged except the EvfImageRef of every "not
+         ready" retry is released (1.2.0 leaked it); LiveViewStats counters. -->
+    <Version>1.3.0</Version>
+    <AssemblyVersion>1.3.0.0</AssemblyVersion>
+    <FileVersion>1.3.0.0</FileVersion>
     <Company>Kingman Husada</Company>
     <Product>EDSDK.NET (QBooth patched)</Product>
   </PropertyGroup>

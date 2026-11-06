@@ -92,6 +92,26 @@ namespace EDSDK.NET
         /// </summary>
         private bool LVoff;
 
+        // Live-view counters (frames, "not ready" answers) since the current live
+        // view started — read by the caller for its log.
+        private long _evfFrames, _evfNotReady, _evfStartTicks;
+
+        /// <summary>Live-view counters since the current live view started:
+        /// frames delivered, "not ready" answers and seconds running. For the
+        /// caller's log; safe to read from any thread.</summary>
+        public string LiveViewStats
+        {
+            get
+            {
+                long start = Interlocked.Read(ref _evfStartTicks);
+                double secs = start == 0 ? 0 : (System.Diagnostics.Stopwatch.GetTimestamp() - start) / (double)System.Diagnostics.Stopwatch.Frequency;
+                long frames = Interlocked.Read(ref _evfFrames);
+                long notReady = Interlocked.Read(ref _evfNotReady);
+                string perSec = secs > 0.5 ? $" ({frames / secs:0.0} fps, {notReady / secs:0.0} not-ready/s)" : "";
+                return $"{frames} frames, {notReady} not-ready in {secs:0.0}s{perSec}";
+            }
+        }
+
         #endregion
 
         #region Events
@@ -1109,17 +1129,31 @@ namespace EDSDK.NET
                     //create stream
                     Error = EdsCreateMemoryStream(0, out stream);
 
+                    Interlocked.Exchange(ref _evfFrames, 0);
+                    Interlocked.Exchange(ref _evfNotReady, 0);
+                    Interlocked.Exchange(ref _evfStartTicks, System.Diagnostics.Stopwatch.GetTimestamp());
+
                     //run live view
                     while (IsLiveViewOn)
                     {
                         lock (STAThread.ExecLock)
                         {
                             //download current live view image
+                            EvfImageRef = IntPtr.Zero;
                             err = EdsCreateEvfImageRef(stream, out EvfImageRef);
                             if (err == EDS_ERR_OK) err = EdsDownloadEvfImage(MainCamera.Ref, EvfImageRef);
-                            if (err == EDS_ERR_OBJECT_NOTREADY) { Thread.Sleep(4); continue; }
+                            if (err == EDS_ERR_OBJECT_NOTREADY)
+                            {
+                                Interlocked.Increment(ref _evfNotReady);
+                                // 1.2.0 skipped this release and leaked one ref per retry
+                                // (~70 per shot on a 1200D). Canon's sample releases it.
+                                if (EvfImageRef != IntPtr.Zero) { EdsRelease(EvfImageRef); EvfImageRef = IntPtr.Zero; }
+                                Thread.Sleep(4);
+                                continue;
+                            }
                             else Error = err;
                         }
+                        Interlocked.Increment(ref _evfFrames);
 
                         //get pointer
                         Error = EdsGetPointer(stream, out jpgPointer);
